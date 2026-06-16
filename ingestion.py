@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import List, Dict, Any
 
 import chromadb
-from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
 from pypdf import PdfReader
 from bs4 import BeautifulSoup
@@ -13,8 +12,15 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from config import config
 
-# Load embedding model once
-embedder = SentenceTransformer("all-MiniLM-L6-v2")
+# ✅ LAZY LOAD - model loads only on first use, not at startup
+_embedder = None
+
+def get_embedder():
+    global _embedder
+    if _embedder is None:
+        print("Loading embedding model...")
+        _embedder = SentenceTransformer("all-MiniLM-L6-v2")
+    return _embedder
 
 # Setup ChromaDB
 chroma_client = chromadb.PersistentClient(path=config.CHROMA_PERSIST_DIR)
@@ -68,6 +74,8 @@ def ingest_documents(file_paths: List[str]) -> Dict[str, Any]:
     processed_files = []
     failed_files = []
 
+    embedder = get_embedder()  # ✅ load once per ingestion call
+
     for file_path in file_paths:
         try:
             print(f"Processing: {file_path}")
@@ -79,7 +87,7 @@ def ingest_documents(file_paths: List[str]) -> Dict[str, Any]:
                 failed_files.append(file_path)
                 continue
 
-            embeddings = embedder.encode(chunks).tolist()
+            embeddings = embedder.encode(chunks, batch_size=32).tolist()  # ✅ batch_size saves memory
             file_name = Path(file_path).name
 
             ids = [f"{file_name}_chunk_{i}" for i in range(len(chunks))]
@@ -93,7 +101,6 @@ def ingest_documents(file_paths: List[str]) -> Dict[str, Any]:
                 for i in range(len(chunks))
             ]
 
-            # Add to ChromaDB in batches of 100
             batch_size = 100
             for i in range(0, len(chunks), batch_size):
                 collection.upsert(
