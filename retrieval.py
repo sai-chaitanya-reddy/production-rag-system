@@ -1,54 +1,35 @@
-import os
-import requests
+import numpy as np
+from typing import List, Tuple, Dict, Any
 
-HF_TOKEN = os.getenv("HF_TOKEN", "")
-headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
+import chromadb
+from config import config
+from ingestion import get_embedder, collection  # ✅ reuse same model + collection, no duplicate load
 
-EMBED_API_URL = "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2"
-RERANK_API_URL = "https://api-inference.huggingface.co/models/cross-encoder/ms-marco-MiniLM-L-6-v2"
+def retrieve(query: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Retrieve top-k relevant documents from ChromaDB using vector similarity."""
+    embedder = get_embedder()  # ✅ returns already-loaded model, no re-loading
+    query_embedding = embedder.encode(query).tolist()
 
-def get_hf_embeddings(texts):
     try:
-        response = requests.post(EMBED_API_URL, headers=headers, json={"inputs": texts, "options": {"wait_for_model": True}}, timeout=10)
-        if response.status_code == 200:
-            return response.json()
-    except Exception:
-        pass
-    return None
+        results = collection.query(
+            query_embeddings=[query_embedding],
+            n_results=config.TOP_K_RETRIEVAL,
+            include=["documents", "metadatas", "distances"]
+        )
+    except Exception as e:
+        print(f"Retrieval error: {e}")
+        return [], []
 
-def hybrid_retrieval(query: str, documents: list, top_k: int = 3):
-    if not documents:
-        return []
-    
-    import numpy as np
-    
-    all_texts = [query] + documents
-    embeddings = get_hf_embeddings(all_texts)
-    
-    if embeddings and len(embeddings) == len(all_texts):
-        query_vector = np.array(embeddings[0])
-        doc_vectors = np.array(embeddings[1:])
-        
-        scores = np.dot(doc_vectors, query_vector) / (np.linalg.norm(doc_vectors, axis=1) * np.linalg.norm(query_vector) + 1e-9)
-        top_indices = np.argsort(scores)[::-1][:top_k * 2]
-        candidate_docs = [documents[i] for i in top_indices]
-    else:
-        candidate_docs = documents[:top_k * 2]
-        
-    try:
-        payload = {
-            "inputs": {
-                "source_sentence": query,
-                "sentences": candidate_docs
-            }
-        }
-        response = requests.post(RERANK_API_URL, headers=headers, json=payload, timeout=5)
-        if response.status_code == 200:
-            api_scores = response.json()
-            if isinstance(api_scores, list) and len(api_scores) == len(candidate_docs):
-                ranked_pairs = sorted(zip(candidate_docs, api_scores), key=lambda x: x[1], reverse=True)
-                return [doc for doc, score in ranked_pairs[:top_k]]
-    except Exception:
-        pass
-        
-    return candidate_docs[:top_k]
+    docs = results.get("documents", [[]])[0]
+    metadatas = results.get("metadatas", [[]])[0]
+
+    if not docs:
+        return [], []
+
+    context_docs = []
+    sources = []
+    for doc, meta in zip(docs, metadatas):
+        context_docs.append({"content": doc, "metadata": meta})
+        sources.append(meta.get("source", "unknown"))
+
+    return context_docs, sources
